@@ -1,13 +1,17 @@
 'use client';
 
-import { memo, useCallback, useEffect, useRef, useState } from 'react';
+import { memo, useCallback, useEffect, useRef, useState, useReducer } from 'react';
 import * as pdfjs from 'pdfjs-dist';
-import type { PDFDocumentProxy, RenderTask } from 'pdfjs-dist';
+import type { PDFDocumentProxy, RenderTask, PageViewport } from 'pdfjs-dist';
+
+import EditLayer from './edit-layer';
+import EditProperties from './edit-properties';
+import { editReducer, initialHistory, type EditObject } from '@/lib/edit-state';
 
 // Bundled and served from this application's origin; no CDN or PDF upload.
 pdfjs.GlobalWorkerOptions.workerSrc = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url).toString();
 
-const PageCanvas = memo(function PageCanvas({ document, page, scale, thumbnail = false }: { document: PDFDocumentProxy; page: number; scale: number; thumbnail?: boolean }) {
+const PageCanvas = memo(function PageCanvas({ document, page, scale, thumbnail = false, onViewport }: { document: PDFDocumentProxy; page: number; scale: number; thumbnail?: boolean; onViewport?: (viewport: PageViewport) => void }) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const host = useRef<HTMLDivElement>(null);
   const [visible, setVisible] = useState(!thumbnail);
@@ -30,6 +34,7 @@ const PageCanvas = memo(function PageCanvas({ document, page, scale, thumbnail =
       const pdfPage = await document.getPage(page);
       if (cancelled) return;
       const base = pdfPage.getViewport({ scale: 1 });
+      onViewport?.(base);
       const viewport = pdfPage.getViewport({ scale: thumbnail ? 120 / base.width : scale });
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
       output.width = Math.ceil(viewport.width * ratio);
@@ -46,12 +51,17 @@ const PageCanvas = memo(function PageCanvas({ document, page, scale, thumbnail =
       if (!cancelled && !(reason instanceof Error && reason.name === 'RenderingCancelledException')) setError('このページを表示できません。');
     });
     return () => { cancelled = true; task?.cancel(); };
-  }, [document, page, scale, thumbnail, visible]);
+  }, [document, page, scale, thumbnail, visible, onViewport]);
   return <div ref={host} className={thumbnail ? 'thumb-paper' : 'paper'}>{error ? <p role="alert">{error}</p> : <canvas ref={canvas} aria-label={`${page}ページ目`} role="img" />}</div>;
 });
 
 export default function PdfEditor() {
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
+  const [history, dispatch] = useReducer(editReducer, initialHistory);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [tool, setTool] = useState<'select' | 'text' | 'highlight'>('select');
+  const [geometry, setGeometry] = useState<{ page: number; viewport: PageViewport } | null>(null);
+  const imageInput = useRef<HTMLInputElement>(null);
   const [name, setName] = useState('');
   const [page, setPage] = useState(1);
   const [scale, setScale] = useState(1);
@@ -62,10 +72,18 @@ export default function PdfEditor() {
   const activeTask = useRef<ReturnType<typeof pdfjs.getDocument> | null>(null);
   const generation = useRef(0);
   useEffect(() => () => { generation.current++; void activeTask.current?.destroy(); }, []);
+  const objects = history.present[page] || [];
+  const selectedItem = objects.find(item => item.id === selected);
+  const onViewport = useCallback((viewport: PageViewport) => setGeometry({ page, viewport }), [page]);
+  const changeObjects = (items: EditObject[]) => dispatch({ type: 'set', page, objects: items });
+  const add = (x: number, y: number) => {
+    const item: EditObject = { id: `edit-${crypto.randomUUID()}`, kind: tool === 'highlight' ? 'highlight' : 'text', x, y, width: 180, height: tool === 'highlight' ? 30 : 100, text: 'テキスト', fontSize: 24, color: tool === 'highlight' ? '#ffe066' : '#202020', opacity: .35 };
+    changeObjects([...objects, item]); setSelected(item.id); setTool('select');
+  };
   const load = useCallback(async (file: File) => {
     if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') { setError('PDFファイルを選択してください。'); return; }
     const id = ++generation.current;
-    setLoading(true); setError(''); setDocument(null);
+    setLoading(true); setError(''); setDocument(null); setGeometry(null); dispatch({ type: 'reset' }); setSelected(null); setTool('select');
     const previous = activeTask.current;
     activeTask.current = null;
     try {
@@ -91,9 +109,33 @@ export default function PdfEditor() {
       <input ref={input} type="file" accept="application/pdf,.pdf" className="hidden" aria-label="PDFファイルを選択" onChange={event => { const file = event.target.files?.[0]; if (file) void load(file); event.target.value = ''; }} />
     </header>
     <aside className="pages"><h2>ページ <span>{document?.numPages || 0}</span></h2><div className="thumbnails">{document ? Array.from({ length: document.numPages }, (_, index) => <button key={`${document.fingerprints[0]}-${index}`} className={`thumbnail ${page === index + 1 ? 'selected' : ''}`} aria-label={`${index + 1}ページへ移動`} aria-current={page === index + 1 ? 'page' : undefined} onClick={() => setPage(index + 1)}><PageCanvas document={document} page={index + 1} scale={1} thumbnail /><span>{index + 1}</span></button>) : <p className="muted">ページ一覧がここに表示されます</p>}</div></aside>
-    <main className="viewer"><div className="status" aria-live="polite">{loading && 'PDFを読み込み中…'}{error && <p role="alert">{error}</p>}</div>{document ? <div className="document"><PageCanvas key={`${document.fingerprints[0]}-${page}-${scale}`} document={document} page={page} scale={scale} /></div> : !loading && <div className="empty"><div className="file-icon">▤</div><p className="eyebrow">A LITTLE SPACE FOR BIG IDEAS</p><h1>PDFから、はじめよう。</h1><p>ファイルをここにドラッグ＆ドロップ<br />または、ボタンからPDFを選択してください。</p><button className="primary" onClick={() => input.current?.click()}>PDFファイルを選択</button><small>🔒 ファイルはブラウザ内だけで処理されます</small></div>}
+    <main className="viewer"><div className="status" aria-live="polite">{loading && 'PDFを読み込み中…'}{error && <p role="alert">{error}</p>}</div>{document ? <div className="document"><div className="page-stack"><PageCanvas key={`${document.fingerprints[0]}-${page}-${scale}`} document={document} page={page} scale={scale} onViewport={onViewport} />{geometry?.page === page && <EditLayer viewport={geometry.viewport} scale={scale} objects={objects} selected={selected} onSelect={setSelected} onChange={changeObjects} tool={tool} onAdd={add} />}</div></div> : !loading && <div className="empty"><div className="file-icon">▤</div><p className="eyebrow">A LITTLE SPACE FOR BIG IDEAS</p><h1>PDFから、はじめよう。</h1><p>ファイルをここにドラッグ＆ドロップ<br />または、ボタンからPDFを選択してください。</p><button className="primary" onClick={() => input.current?.click()}>PDFファイルを選択</button><small>🔒 ファイルはブラウザ内だけで処理されます</small></div>}
     <nav className="pagination" aria-label="ページ移動"><button aria-label="前のページ" disabled={!document || page <= 1} onClick={() => setPage(value => value - 1)}>←</button><span>{document ? page : 0} <span className="muted">/ {document?.numPages || 0}</span></span><button aria-label="次のページ" disabled={!document || page >= document.numPages} onClick={() => setPage(value => value + 1)}>→</button></nav></main>
-    <aside className="properties"><h2>プロパティ</h2><span className="badge">COMING SOON</span><h3>編集のためのスペース</h3><p>テキストや注釈などの編集プロパティがここに表示されます。</p><div className="privacy"><strong>あなたのファイルは、あなたの手元に。</strong><p>PDFを外部サーバーへ送信することはありません。</p></div></aside>
+    <aside className="properties"><h2>編集プロパティ</h2><div className="edit-tools">
+      <button disabled={!document} aria-pressed={tool === 'select'} onClick={() => setTool('select')}>選択・移動</button>
+      <button disabled={!document} aria-pressed={tool === 'text'} onClick={() => setTool('text')}>文字を追加</button>
+      <button disabled={!document} aria-pressed={tool === 'highlight'} onClick={() => setTool('highlight')}>ハイライトを追加</button>
+      <button disabled={!document || geometry?.page !== page} onClick={() => imageInput.current?.click()}>画像を追加</button>
+      <button disabled={!history.past.length} onClick={() => { dispatch({ type: 'undo' }); setSelected(null); }}>Undo</button>
+      <button disabled={!history.future.length} onClick={() => { dispatch({ type: 'redo' }); setSelected(null); }}>Redo</button>
+      <input ref={imageInput} className="hidden" type="file" accept="image/png,image/jpeg,image/webp" aria-label="画像ファイルを選択" onChange={async event => {
+        const file = event.target.files?.[0]; event.target.value = '';
+        if (!file || !geometry || !document) return;
+        const id = generation.current; const targetPage = page;
+        try {
+          if (!['image/png', 'image/jpeg', 'image/webp'].includes(file.type)) throw new Error('unsupported');
+          const src = await new Promise<string>((resolve, reject) => { const reader = new FileReader(); reader.onload = () => resolve(String(reader.result)); reader.onerror = reject; reader.readAsDataURL(file); });
+          const bitmap = new Image(); bitmap.src = src; await bitmap.decode();
+          if (id !== generation.current) return;
+          const [x, y] = geometry.viewport.convertToPdfPoint(30, 30);
+          const item: EditObject = { id: `edit-${crypto.randomUUID()}`, kind: 'image', x, y, width: 150, height: 150 * bitmap.height / bitmap.width, text: '', fontSize: 24, color: '#000000', opacity: 1, src };
+          dispatch({ type: 'append', page: targetPage, item }); setSelected(item.id); setTool('select');
+        } catch { setError('画像を読み込めません。PNG・JPEG・WebPを選択してください。'); }
+      }} />
+    </div><p>{tool === 'select' ? '要素を選択してドラッグできます。' : 'PDF上をクリックして追加してください。'}</p>
+    {selectedItem && <EditProperties key={JSON.stringify(selectedItem)} item={selectedItem} onSave={item => changeObjects(objects.map(old => old.id === item.id ? item : old))} onDelete={() => { changeObjects(objects.filter(item => item.id !== selected)); setSelected(null); }} />}
+    <div className="object-list" aria-label="追加した要素">{objects.map((item, index) => <button key={item.id} aria-pressed={selected === item.id} onClick={() => setSelected(item.id)}>{index + 1}: {item.kind === 'text' ? item.text || '空の文字' : item.kind === 'image' ? '画像' : 'ハイライト'}</button>)}</div>
+    <p>編集はこの画面内のみです。別のPDFを開く・再読み込みすると失われます。PDF書き出しは未対応です。</p></aside>
     <footer>PDF STUDIO <span>ローカル処理 · プライバシーを大切に</span></footer>{dragging && <div className="drop-overlay">PDFをドロップして開く</div>}
   </div>;
 }
