@@ -2,3 +2,7 @@ node_modules/
 .next/
 out/
 *.tsbuildinfo
+public/mupdf/
+public/source.tar.gz
+
+.source-files.json

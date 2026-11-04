@@ -1,0 +1,30 @@
+import { chromium } from 'playwright';
+import * as m from 'mupdf';
+import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+const doc = new m.PDFDocument(); const font = new m.Font('Helvetica');
+for (const text of ['Original text', 'Other page']) doc.insertPage(-1, doc.addPage([0,0,400,500],0,{Font:{F1:doc.addSimpleFont(font)}},`BT /F1 24 Tf 40 400 Td (${text}) Tj ET`));
+const data = doc.saveToBuffer(''); const bytes=Buffer.from(data.asUint8Array());data.destroy();font.destroy();doc.destroy();
+const browser=await chromium.launch({executablePath:process.env.CHROMIUM_PATH || undefined,headless:true,args:['--no-sandbox']});
+try {
+ const page=await browser.newPage({viewport:{width:1500,height:1100}});const errors=[];const external=[];
+ const base=process.env.TEST_URL || 'http://localhost:3004';
+ page.on('pageerror',error=>errors.push(error.message));page.on('request',request=>{if(request.url().startsWith('http')&&!request.url().startsWith(new URL(base).origin))external.push(request.url());});
+ await page.goto(base);
+ await page.getByLabel('PDFファイルを選択').setInputFiles({name:'original.pdf',mimeType:'application/pdf',buffer:bytes});
+ await page.getByRole('button',{name:'既存文字を編集',exact:true}).click();
+ await page.getByRole('button',{name:'既存文字: Original text',exact:true}).click();
+ await page.getByLabel('置換後の文字').fill('日本語');await page.getByRole('button',{name:'PDFの文字を置換',exact:true}).click();
+ await page.getByRole('button',{name:'既存文字: 日本語',exact:true}).waitFor();
+ assert.equal(await page.getByRole('button',{name:'既存文字: Original text',exact:true}).count(),0);
+ await page.getByRole('button',{name:'文字変更を元に戻す',exact:true}).click();await page.getByRole('button',{name:'既存文字: Original text',exact:true}).waitFor();
+ await page.getByRole('button',{name:'文字変更をやり直す',exact:true}).click();await page.getByRole('button',{name:'既存文字: 日本語',exact:true}).waitFor();
+ await page.getByRole('button',{name:'拡大',exact:true}).click();await page.getByRole('button',{name:'既存文字: 日本語',exact:true}).click();await page.getByRole('button',{name:'キャンセル',exact:true}).click();
+ await page.getByRole('button',{name:'次のページ'}).click();await page.getByRole('button',{name:'既存文字: Other page',exact:true}).waitFor();
+ const downloadPromise=page.waitForEvent('download');await page.getByRole('button',{name:'文字変更PDFをダウンロード',exact:true}).click();const download=await downloadPromise;
+ const saved=new m.PDFDocument(await fs.readFile(await download.path()));const first=saved.loadPage(0),second=saved.loadPage(1);const text1=first.toStructuredText(''),text2=second.toStructuredText('');
+ assert.equal(text1.asText().trim(),'日本語');assert.equal(text2.asText().trim(),'Other page');text1.destroy();text2.destroy();first.destroy();second.destroy();saved.destroy();
+ const source=await page.request.get(new URL('source.tar.gz',base.endsWith('/')?base:base+'/').href);assert.equal(source.status(),200);
+ assert.deepEqual(errors,[]);assert.deepEqual(external,[]);
+ console.log('PASS: direct click replacement, Japanese extraction, undo/redo, zoom, pages, PDF download, source download, no external requests');
+} finally {await browser.close();}
