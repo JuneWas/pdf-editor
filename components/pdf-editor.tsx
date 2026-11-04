@@ -4,6 +4,7 @@ import { memo, useCallback, useEffect, useRef, useState, useReducer } from 'reac
 import * as pdfjs from 'pdfjs-dist';
 import type { PDFDocumentProxy, RenderTask, PageViewport } from 'pdfjs-dist';
 
+import DirectTextEditor from './direct-text-editor';
 import EditLayer from './edit-layer';
 import EditProperties from './edit-properties';
 import { editReducer, initialHistory, type EditObject } from '@/lib/edit-state';
@@ -56,6 +57,10 @@ const PageCanvas = memo(function PageCanvas({ document, page, scale, thumbnail =
 });
 
 export default function PdfEditor() {
+  const [pdfBytes, setPdfBytes] = useState<Uint8Array<ArrayBuffer> | null>(null);
+  const [directMode, setDirectMode] = useState(false);
+  const [session, setSession] = useState(0);
+  const [revision, setRevision] = useState(0);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
   const [history, dispatch] = useReducer(editReducer, initialHistory);
   const [selected, setSelected] = useState<string | null>(null);
@@ -83,6 +88,7 @@ export default function PdfEditor() {
   const load = useCallback(async (file: File) => {
     if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') { setError('PDFファイルを選択してください。'); return; }
     const id = ++generation.current;
+    setPdfBytes(null); setDirectMode(false); setSession(id); setRevision(0);
     setLoading(true); setError(''); setDocument(null); setGeometry(null); dispatch({ type: 'reset' }); setSelected(null); setTool('select');
     const previous = activeTask.current;
     activeTask.current = null;
@@ -91,15 +97,28 @@ export default function PdfEditor() {
       if (id !== generation.current) return;
       const data = await file.arrayBuffer();
       if (id !== generation.current) return;
+      const retained = new Uint8Array(data.slice(0));
       const task = pdfjs.getDocument({ data });
       activeTask.current = task;
       const next = await task.promise;
       if (id !== generation.current) { await task.destroy(); return; }
-      setDocument(next); setName(file.name); setPage(1); setScale(1);
+      setDocument(next); setPdfBytes(retained); setName(file.name); setPage(1); setScale(1);
     } catch (reason) {
       if (id === generation.current) setError(reason instanceof Error && reason.name === 'PasswordException' ? 'パスワード付きPDFにはまだ対応していません。' : 'PDFを読み込めませんでした。ファイルが破損していないか確認してください。');
     } finally { if (id === generation.current) setLoading(false); }
   }, []);
+  const replacePdf = async (data: Uint8Array<ArrayBuffer>) => {
+    const id = generation.current;
+    const task = pdfjs.getDocument({ data: data.slice() });
+    try {
+      const next = await task.promise;
+      if (id !== generation.current) { await task.destroy(); return false; }
+      const previous = activeTask.current; activeTask.current = task;
+      setDocument(next); setPdfBytes(data); setRevision(value => value + 1); setError('');
+      void previous?.destroy();
+      return true;
+    } catch { await task.destroy(); if (id === generation.current) setError('変更後のPDFを表示できませんでした。元のPDFを維持します。'); return false; }
+  };
   return <div className="studio" onDragOver={event => { event.preventDefault(); if (event.dataTransfer.types.includes('Files')) setDragging(true); }} onDragLeave={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false); }} onDrop={event => { event.preventDefault(); setDragging(false); const file = event.dataTransfer.files[0]; if (file) void load(file); }}>
     <header className="toolbar">
       <div className="brand"><span className="brand-icon">P</span><div>PDF Studio<small>YOUR PRIVATE WORKSPACE</small></div></div>
@@ -108,13 +127,13 @@ export default function PdfEditor() {
       <button className="primary" onClick={() => input.current?.click()}>↑ PDFを開く</button>
       <input ref={input} type="file" accept="application/pdf,.pdf" className="hidden" aria-label="PDFファイルを選択" onChange={event => { const file = event.target.files?.[0]; if (file) void load(file); event.target.value = ''; }} />
     </header>
-    <aside className="pages"><h2>ページ <span>{document?.numPages || 0}</span></h2><div className="thumbnails">{document ? Array.from({ length: document.numPages }, (_, index) => <button key={`${document.fingerprints[0]}-${index}`} className={`thumbnail ${page === index + 1 ? 'selected' : ''}`} aria-label={`${index + 1}ページへ移動`} aria-current={page === index + 1 ? 'page' : undefined} onClick={() => setPage(index + 1)}><PageCanvas document={document} page={index + 1} scale={1} thumbnail /><span>{index + 1}</span></button>) : <p className="muted">ページ一覧がここに表示されます</p>}</div></aside>
-    <main className="viewer"><div className="status" aria-live="polite">{loading && 'PDFを読み込み中…'}{error && <p role="alert">{error}</p>}</div>{document ? <div className="document"><div className="page-stack"><PageCanvas key={`${document.fingerprints[0]}-${page}-${scale}`} document={document} page={page} scale={scale} onViewport={onViewport} />{geometry?.page === page && <EditLayer viewport={geometry.viewport} scale={scale} objects={objects} selected={selected} onSelect={setSelected} onChange={changeObjects} tool={tool} onAdd={add} />}</div></div> : !loading && <div className="empty"><div className="file-icon">▤</div><p className="eyebrow">A LITTLE SPACE FOR BIG IDEAS</p><h1>PDFから、はじめよう。</h1><p>ファイルをここにドラッグ＆ドロップ<br />または、ボタンからPDFを選択してください。</p><button className="primary" onClick={() => input.current?.click()}>PDFファイルを選択</button><small>🔒 ファイルはブラウザ内だけで処理されます</small></div>}
+    <aside className="pages"><h2>ページ <span>{document?.numPages || 0}</span></h2><div className="thumbnails">{document ? Array.from({ length: document.numPages }, (_, index) => <button key={`${revision}-${document.fingerprints[0]}-${index}`} className={`thumbnail ${page === index + 1 ? 'selected' : ''}`} aria-label={`${index + 1}ページへ移動`} aria-current={page === index + 1 ? 'page' : undefined} onClick={() => setPage(index + 1)}><PageCanvas document={document} page={index + 1} scale={1} thumbnail /><span>{index + 1}</span></button>) : <p className="muted">ページ一覧がここに表示されます</p>}</div></aside>
+    <main className="viewer"><div className="status" aria-live="polite">{loading && 'PDFを読み込み中…'}{error && <p role="alert">{error}</p>}</div>{document ? <div className="document"><div className="page-stack"><PageCanvas key={`${revision}-${document.fingerprints[0]}-${page}-${scale}`} document={document} page={page} scale={scale} onViewport={onViewport} />{geometry?.page === page && !directMode && <EditLayer viewport={geometry.viewport} scale={scale} objects={objects} selected={selected} onSelect={setSelected} onChange={changeObjects} tool={tool} onAdd={add} />}{pdfBytes && <DirectTextEditor key={session} bytes={pdfBytes} page={page} scale={scale} enabled={directMode} name={name} onReplace={replacePdf} />}</div></div> : !loading && <div className="empty"><div className="file-icon">▤</div><p className="eyebrow">A LITTLE SPACE FOR BIG IDEAS</p><h1>PDFから、はじめよう。</h1><p>ファイルをここにドラッグ＆ドロップ<br />または、ボタンからPDFを選択してください。</p><button className="primary" onClick={() => input.current?.click()}>PDFファイルを選択</button><small>🔒 ファイルはブラウザ内だけで処理されます</small></div>}
     <nav className="pagination" aria-label="ページ移動"><button aria-label="前のページ" disabled={!document || page <= 1} onClick={() => setPage(value => value - 1)}>←</button><span>{document ? page : 0} <span className="muted">/ {document?.numPages || 0}</span></span><button aria-label="次のページ" disabled={!document || page >= document.numPages} onClick={() => setPage(value => value + 1)}>→</button></nav></main>
-    <aside className="properties"><h2>編集プロパティ</h2><div className="edit-tools">
-      <button disabled={!document} aria-pressed={tool === 'select'} onClick={() => setTool('select')}>選択・移動</button>
-      <button disabled={!document} aria-pressed={tool === 'text'} onClick={() => setTool('text')}>文字を追加</button>
-      <button disabled={!document} aria-pressed={tool === 'highlight'} onClick={() => setTool('highlight')}>ハイライトを追加</button>
+    <aside className="properties"><button disabled={!document} aria-pressed={directMode} onClick={() => setDirectMode(value => !value)}>既存文字を編集</button><div id="direct-panel" /><h2>編集プロパティ</h2><div className="edit-tools">
+      <button disabled={!document} aria-pressed={tool === 'select'} onClick={() => { setTool('select'); setDirectMode(false); }}>選択・移動</button>
+      <button disabled={!document} aria-pressed={tool === 'text'} onClick={() => { setTool('text'); setDirectMode(false); }}>文字を追加</button>
+      <button disabled={!document} aria-pressed={tool === 'highlight'} onClick={() => { setTool('highlight'); setDirectMode(false); }}>ハイライトを追加</button>
       <button disabled={!document || geometry?.page !== page} onClick={() => imageInput.current?.click()}>画像を追加</button>
       <button disabled={!history.past.length} onClick={() => { dispatch({ type: 'undo' }); setSelected(null); }}>Undo</button>
       <button disabled={!history.future.length} onClick={() => { dispatch({ type: 'redo' }); setSelected(null); }}>Redo</button>
@@ -135,7 +154,7 @@ export default function PdfEditor() {
     </div><p>{tool === 'select' ? '要素を選択してドラッグできます。' : 'PDF上をクリックして追加してください。'}</p>
     {selectedItem && <EditProperties key={JSON.stringify(selectedItem)} item={selectedItem} onSave={item => changeObjects(objects.map(old => old.id === item.id ? item : old))} onDelete={() => { changeObjects(objects.filter(item => item.id !== selected)); setSelected(null); }} />}
     <div className="object-list" aria-label="追加した要素">{objects.map((item, index) => <button key={item.id} aria-pressed={selected === item.id} onClick={() => setSelected(item.id)}>{index + 1}: {item.kind === 'text' ? item.text || '空の文字' : item.kind === 'image' ? '画像' : 'ハイライト'}</button>)}</div>
-    <p>編集はこの画面内のみです。別のPDFを開く・再読み込みすると失われます。PDF書き出しは未対応です。</p></aside>
-    <footer>PDF STUDIO <span>ローカル処理 · プライバシーを大切に</span></footer>{dragging && <div className="drop-overlay">PDFをドロップして開く</div>}
+    <p>編集はこの画面内のみです。別のPDFを開く・再読み込みすると失われます。追加要素のPDF書き出しは未対応です。既存文字の変更はダウンロードで保存できます。</p></aside>
+    <footer>PDF STUDIO <a href={`${process.env.NEXT_PUBLIC_BASE_PATH || ''}/source.tar.gz`}>ソースを取得 (AGPL-3.0+)</a><a href="https://github.com/JuneWas/pdf-editor">GitHub</a><span>ローカル処理 · プライバシーを大切に</span></footer>{dragging && <div className="drop-overlay">PDFをドロップして開く</div>}
   </div>;
 }
